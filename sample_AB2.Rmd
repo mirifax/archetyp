@@ -1,0 +1,351 @@
+---
+title: "Project2_inspect"
+author: "maxel"
+date: "2/17/2022, revised 20/02/2023"
+output: html_document
+---
+# Seurat with 10X Multiome data of Drosophila melanogaster stage 6
+The input data is generated with cellranger-arc 2.00 and is stored on the fast/mfaxel_fast/project2/multiome_RNA_ATAC. In those folders there is also a summary.html file from cellranger. 
+This script loads the data into Seurat in order to 
+1) filter out yolk cells and potential doublets and subset to protein coding genes
+2) make a seurat object
+3) perform dimensional reduction and clustering for RNA, ATAC and combined data 
+5) save the data as count matrices for novoSpaRcs
+
+```{r,echo=FALSE, warning=F, message=F}
+#load libraries
+library(Signac) #1.5.0
+library(SeuratObject) #4.0.4
+library(Seurat) #4.0.6
+require(magrittr) #2.0.1
+require(readr) #2.1.1
+require(Matrix) #1.4-0
+require(tidyr) #1.1.4
+require(dplyr) #1.0.7
+library(TxDb.Dmelanogaster.UCSC.dm6.ensGene) #3.12.0
+library(rmarkdown) #2.11
+library(ggplot2) #3.3.5
+library(GenomicFeatures) #1.42.0
+library(rtracklayer) #1.50.0
+
+#output paths
+path_out <- "data_out_shiny/"
+if (!dir.exists(path_out)) dir.create(path_out)
+
+path_novo<-paste0(path_out,"data_for_novosparc/")
+if (!dir.exists(path_novo)) dir.create(path_novo)
+
+```
+
+
+Load the data
+```{r, echo=FALSE, warning=F, message=F}
+#load annotation data for dm6 
+annotations_dm6 <- genes(TxDb.Dmelanogaster.UCSC.dm6.ensGene) #there are just genes and no TSS regions etc now!
+seqlevelsStyle(annotations_dm6) <- "UCSC" #make sure the chr is presented the right way
+
+#load gtf file dm6
+gtf <- rtracklayer::import("Drosophila_melanogaster.BDGP6.28.100.chr.gtf")
+
+#load fragemnt data from cellranger-arc folder
+fragpath <- "../../../fast/AG_Zinzen/mfaxel_fast/project2/multiome_RNA_ATAC/aggr_arc/sample_AB/outs/atac_fragments.tsv.gz"
+mex_dir_path <- "../../../fast/AG_Zinzen/mfaxel_fast/project2/multiome_RNA_ATAC/aggr_arc/sample_AB/outs/filtered_feature_bc_matrix"
+
+mtx_path <- paste(mex_dir_path, "matrix.mtx.gz", sep = '/')
+feature_path <- paste(mex_dir_path, "features.tsv.gz", sep = '/')
+barcode_path <- paste(mex_dir_path, "barcodes.tsv.gz", sep = '/')
+ 
+features <- readr::read_tsv(feature_path, col_names = F) %>% tidyr::unite(feature, sep = ",") # there might be some chrU_names in there
+barcodes <- readr::read_tsv(barcode_path, col_names = F) %>% tidyr::unite(barcode)
+ 
+mtx_1 <- Matrix::readMM(mtx_path) %>%
+  magrittr::set_rownames(features$feature) %>%
+  magrittr::set_colnames(barcodes$barcode)
+
+#split into RNA and ATAC features
+GEX_index<- c(1:max(grep("Gene",rownames(mtx_1))))
+ATAC_index <- c(min(grep("Peaks",rownames(mtx_1))):length(rownames(mtx_1)))
+
+GEX_counts <- mtx_1[GEX_index,]
+GEX_counts_names <-read.table(text = rownames(GEX_counts),sep = ",") 
+rownames(GEX_counts) <- GEX_counts_names$V1
+
+ATAC_counts <- mtx_1[ATAC_index,]
+ATAC_counts_names <- read.table(text = rownames(ATAC_counts),sep = ",") 
+rownames(ATAC_counts) <- ATAC_counts_names$V1
+```
+
+
+## (1) filter the cells and genes 
+in the Karaiskos&Wahle (2017), they sorted out:
+a) every cell with more than 5 UMIs for mesodermal and dorsal ectodermal marker genes (i removed marker genes, because they looked to overlapping)
+b) pole cells if cell containing at least 3 UMIs of gene: pgc (pole cells are concentrating in the posterior-dorsal pole, so we did not flter them out)
+c) yolk cells by at least 10 UMI of yolk marker genes
+d) filter for protein coding genes
+e) filter for peaks within the 4 main chromosomes
+
+adjusted based on checking some genes and where they are spatially expressed:
+```{r, echo=FALSE, warning=F, message=F}
+pole_mark <-"FBgn0016053" #pgc
+yolk_mark <-  c("FBgn0032629", "FBgn0037684", "FBgn0034032", "FBgn0030028", "FBgn0033371", "FBgn0003411", "FBgn0037000")#beat-IIIc, CG8129, CG8195, Corp, CNT1, sisA, ZnT77C
+dorsal_mark<- c("FBgn0003053","FBgn0003963","FBgn0004053","FBgn0004885","FBgn0012037","FBgn0028789","FBgn0035388","FBgn0035956") #FBgn0033483  Ance, CG2162, Doc1, Doc2, egr, peb, tok, ush, zen
+mesoderm_mark <- c("FBgn0003308","FBgn0003448","FBgn0003900","FBgn0004512","FBgn0004606","FBgn0020299","FBgn0030941","FBgn0032693") #"FBgn0033638","FBgn0015773" #CG9005, Cyp310a1, GEFmeso, ltl, Mdr49, Mes2, NetA, ry, sna, stumps, twi, wgn, zfh1
+  
+pole_cells <- names(which(GEX_counts[pole_mark,]>10)) #3
+yolk_cells <- names(which(apply(GEX_counts[yolk_mark,],2,sum) >10)) 
+ 
+dorsal_UMIs <- apply(GEX_counts[dorsal_mark,],2, sum)
+mesodermal_UMIs <- apply(GEX_counts[mesoderm_mark,],2, sum) 
+doublet_cells <- names(which(dorsal_UMIs>5 & mesodermal_UMIs>5)) #5
+
+plot(x=mesodermal_UMIs, y=dorsal_UMIs, col= ifelse(dorsal_UMIs>5 & mesodermal_UMIs>5, "red", "black"),title("doublets in red"))
+```
+remove cells and genes
+```{r, echo=FALSE, warning=F, message=F}
+# remove cells
+discard_cells<- unique(c(doublet_cells,yolk_cells))
+print(paste("number of cells discarded, because of overlap with yolk or marker genes or potential doublets: ",length(discard_cells)))
+
+GEX_counts <- GEX_counts[,!colnames(GEX_counts) %in% discard_cells]
+ATAC_counts <-ATAC_counts[,!colnames(ATAC_counts) %in% discard_cells] 
+
+#remove genes without expression 
+non_expressed_genes <- rownames(GEX_counts)[which(apply(GEX_counts,1,sum)==0)]
+print(paste("number of non-expressed genes: ",length(non_expressed_genes)))
+GEX_counts <- GEX_counts[!rownames(GEX_counts) %in% non_expressed_genes,]
+
+#filter for protein_coding genes
+gtf_genes <- gtf[gtf$gene_id %in% rownames(GEX_counts)]
+gtf_protein_genes <- gtf_genes[gtf_genes$gene_biotype =="protein_coding",]
+protein_genes <- unique(gtf_protein_genes$gene_id)
+print(paste("number of non_protein_genes discarded: ", length(rownames(GEX_counts)) - length(protein_genes)))
+GEX_counts <- GEX_counts[rownames(GEX_counts) %in% protein_genes,]
+
+# filter for peaks within the main chromosomes
+peaks <- rownames(ATAC_counts)
+chrom<- unlist(lapply(strsplit(peaks,":"),`[`,1))
+
+trash_peaks <- rownames(ATAC_counts)[grep("chrUn",rownames(ATAC_counts))]
+ATAC_counts <- ATAC_counts[!rownames(ATAC_counts) %in% trash_peaks,]
+
+print(paste("the following peaks were discarded: ",trash_peaks))
+```
+
+
+
+##(2) Create a SeuratObject with 2 assays:  
+```{r, echo=FALSE, warning=F, message=F}
+stage6 <- CreateSeuratObject(
+  counts = GEX_counts,
+  assay = "RNA"
+)
+
+stage6[["ATAC"]] <- CreateChromatinAssay( #add ATAC data
+  counts = ATAC_counts,
+  sep = c(":","-"),
+  fragments = fragpath,
+  annotation = annotations_dm6
+  
+)
+
+print(stage6@assays)
+```
+
+Overview of the data: nCount of RNA and ATAC  
+```{r, , echo=FALSE, warning=F, message=F}
+# get some statistics about the data
+p_vln<-VlnPlot(
+  object = stage6,
+  group.by = "orig.ident",
+  features = c("nCount_RNA","nFeature_RNA", "nCount_ATAC","nFeature_ATAC"),
+  ncol = 4,
+  pt.size = 0)
+
+p_vln
+
+png(file=paste0(path_out,"plots/Violin_plot_all.png"))
+p_vln
+dev.off()
+```
+
+
+## (3) dimensional reduction and clustering  
+## RNA :  
+
+First identify the highly variable features, in this case genes. Because not all genes show variation in the data and are thus considered to be uninformative for us.  
+```{r, echo=F, warning=F, message=F}
+DefaultAssay(stage6) <- "RNA"
+stage6 <- NormalizeData(stage6) #normalize count data and then look at highly variable genes
+stage6 <- FindVariableFeatures(stage6, selection.method = "vst") #highly variable features
+top10 <- head(VariableFeatures(stage6), 25)# Identify the 10 most highly variable genes
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(stage6)
+plot1
+
+#save those 2000 hvg genes
+hvg <- VariableFeatures(stage6)
+write.csv(as.data.frame(hvg),paste0(path_novo,"2000hvg.tsv"),sep = ",",quote=T, row.names = F, col.names = F)
+```
+
+Next scale the data, run a PCA and cluster the cells, which looks like this:  
+```{r, echo=F, warning=F, message=F}
+all.genes <- rownames(stage6) 
+stage6 <- ScaleData(stage6, features = all.genes) #scale the GEX
+stage6 <- RunPCA(stage6, features = VariableFeatures(object = stage6),verbose = F)
+VizDimLoadings(stage6, dims = 1:2, reduction = "pca")
+DimPlot(stage6, reduction = "pca")
+ElbowPlot(stage6, ndim=50)
+
+stage6 <- FindNeighbors(stage6, dims = 2:50)
+stage6 <- FindClusters(stage6, resolution=0.8)
+stage6 <- RunUMAP(stage6, reduction.name =  'RNAumap',dims = 2:50, verbose = F)
+p1<-DimPlot(stage6, reduction = "RNAumap", label = F ) + ggtitle(paste("stage6, RNA, cells:",length(colnames(stage6))))
+p1
+
+#save these clusters to RNA_cluster
+stage6$RNA_clusters <- stage6$RNA_snn_res.0.8
+
+#save the plot 
+pdf(file=paste0(path_out,"plots/Dim_plot_RNA.pdf"))
+p1
+dev.off()
+```
+
+Identify marker genes for each cluster:   
+```{r, echo=F, warning=F, message=F}
+stage6.markers <- FindAllMarkers(stage6, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, verbose = F,test.use="roc")
+table_markers<-stage6.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 20, order_by = avg_log2FC)
+
+print(table_markers)
+write.table(table_markers,paste0(path_out,"RNA_cluster_marker_genes.csv"), row.names = F,sep = ",")
+```
+
+
+example feature plots for snail, twist, zen, egr:
+```{r, echo=FALSE, warning=F, message=F}
+p1<- FeaturePlot(stage6, features = c("FBgn0003448","FBgn0003900","FBgn0004053","FBgn0033483"))#snail, twist, zen, egr
+
+png(file=paste0(path_out,"plots/RNA_UMAP_4genes.png"))
+p1
+dev.off()
+```
+
+## ATAC :  
+
+```{r, echo=F, warning=F, message=F}
+DefaultAssay(stage6) <- "ATAC"
+
+stage6 <- RunTFIDF(stage6) # this is a normalization step across cells and across peaks 
+stage6 <- FindTopFeatures(stage6, min.cutoff = 'q0')
+stage6 <- RunSVD(stage6)
+DepthCor(stage6, n =20)
+```
+
+Clustering the cells by ATAC peaks looks like:  
+```{r, echo=F, warning=F, message=F}
+stage6 <- RunUMAP(object = stage6, reduction.name = 'ATACumap', reduction = 'lsi', dims = 2:50)
+stage6 <- FindNeighbors(object = stage6, reduction = 'lsi', dims = 2:50)
+stage6 <- FindClusters(object = stage6, verbose = FALSE, algorithm = 3, resolution = 0.8)
+p2 <-DimPlot(object = stage6, reduction='ATACumap', label = F ) + ggtitle(paste("stage6, ATAC ,  cells:",length(colnames(stage6))))
+
+#save these clusters to ATAC_cluster
+stage6$ATAC_clusters <- stage6$ATAC_snn_res.0.8
+
+#sve the image
+pdf(file=paste0(path_out,"/plots/Dim_plot_ATAC.pdf"))
+p2
+dev.off()
+```
+
+## Weighted nearest neighbour (WNN) Analysis on RNA + ATAC   
+
+```{r,echo=F, warning=F, message=F}
+#WNN combination of RNA ATAC_count
+stage6 <- FindMultiModalNeighbors(stage6, reduction.list = list("pca", "lsi"), dims.list = list(2:50, 2:50))
+stage6 <- RunUMAP(stage6, nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+stage6 <- FindClusters(stage6, graph.name = "wsnn", algorithm = 3, verbose = FALSE)
+p3 <-DimPlot(stage6, reduction = "wnn.umap", label = TRUE, label.size = 2.5, repel = TRUE)+ ggtitle("stage6, RNA+ATAC , 5k cells")
+
+#save these clusters to WNN_cluster
+stage6$WNN_clusters <- stage6$wsnn_res.0.8
+
+pdf(file=paste0(path_out,"/plots/Dim_plot_RNA_ATAC.pdf"))
+p3
+dev.off()
+```
+
+
+## save the data 
+
+```{r,echo=F, warning=F, message=F}
+#save the SeuratObject
+saveRDS(stage6, file = paste0(path_out,"stage6.rds"))
+```
+
+
+```{r, echo=F, eval=F}
+###### RNA ####
+path_rna <- paste0(path_novo,'rna/')
+if (!dir.exists(path_rna)) dir.create(path_rna)
+
+#all counts
+counts <- GetAssayData(stage6, assay = "RNA", slot = "count")
+write.csv(as.matrix(counts),paste0(path_rna,"/rna_counts.tsv"),sep = ",",quote=F, row.names = T, col.names = T)
+#counts subsetted by HVG
+hvg_index <- stage6[["RNA"]]@meta.features$vst.variable
+counts_hvg <- GetAssayData(stage6,assay="RNA", slot="data")[hvg_index,]
+write.csv(as.matrix(counts_hvg), paste0(path_rna,"/rna_counts_hvg.tsv"),sep = ",",quote=F, row.names = T, col.names = T)
+write.table(rownames(counts_hvg),paste0(path_rna,"/hvg_names.csv"))
+#scaled counts all 
+counts <- GetAssayData(stage6, assay = "RNA", slot = "data")
+write.csv(as.matrix(counts),paste0(path_rna,"/rna_counts_scaled.tsv"),sep = ",",quote=F, row.names = T, col.names = T)
+#scaled counts HVG
+counts_hvg_normalized <- GetAssayData(stage6,assay="RNA", slot="data")[hvg_index,]
+write.csv(as.matrix(counts_hvg_normalized), paste0(path_rna,"/rna_counts_hvg_scaled.tsv"),sep = ",",quote=F, row.names = T, col.names = T)
+
+##### ATAC ####
+path_atac <- paste0(path_novo,'atac/')
+if (!dir.exists(path_atac)) dir.create(path_atac)
+
+#all counts
+counts <- GetAssayData(stage6, assay = "ATAC", slot = "counts")
+write.csv(as.matrix(counts),paste0(path_atac,"/atac_counts.tsv"),sep = ",",quote=F, row.names = T, col.names = T)
+#scaled counts 
+counts <- GetAssayData(stage6, assay = "ATAC", slot = "data")
+write.csv(as.matrix(counts),paste0(path_atac,"/ATAC_counts_scaled.tsv"),sep = ",",quote=F, row.names = T, col.names = T)
+
+#ATAC ranges
+ranges <- GetAssayData(stage6,assay="ATAC", slot="ranges")
+export.bed(ranges, paste0(path_atac,"/atac_ranges.bed"))
+write.table(rownames(counts),paste0(path_atac,"/atac_ranges.csv"))
+```
+
+```{r}
+#save the WNN clusters to check where they fall later on on the virtual embryo together with umap reductions
+WNNcluster <- cbind(as.data.frame(stage6$wsnn_res.0.8),Embeddings(stage6, reduction = "wnn.umap") )
+write.table(WNNcluster, file= file.path(path_out,"WNN_cluster_idents"))
+
+RNAcluster <- cbind(as.data.frame(stage6$RNA_snn_res.0.8), Embeddings(stage6, reduction = "RNAumap"))
+write.table(RNAcluster, file= file.path(path_out,"RNA_cluster_idents"))
+
+ATACcluster <- cbind(as.data.frame(stage6$ATAC_snn_res.0.8),Embeddings(stage6,reduction="lsi"))
+write.table(ATACcluster, file= file.path(path_out,"ATAC_cluster_idents"))
+```
+
+# save for the shiny app 
+```{r}
+path_shiny <- "data_out_seurat/shiny"
+if (!dir.exists(path_shiny)) dir.create(path_shiny)
+
+#all counts
+counts <- as.data.frame(t(GetAssayData(stage6, assay = "RNA", slot = "count")))
+write_fst(counts, paste0(path_shiny,"/rna_counts.fst"))
+
+counts <- as.data.frame(t(GetAssayData(stage6, assay = "ATAC", slot = "counts")))
+write_fst(counts,paste0(path_shiny,"/atac_counts.fst"))
+
+```
+
