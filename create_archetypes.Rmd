@@ -1,0 +1,161 @@
+---
+title: "spatialDCA and spatialDGE"
+author: "Miriam"
+date: "3/4/2022, updated 25 october 2022"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+#  Input is the output from Novosparc, which is a probabilistic spatial reconstruction of Gene Expression and Chromatin Accessibility
+# The data was produced Dec 2021 with 10X Multiome and then fed into Novosparc, together with 84 marker genes from the BDGP project
+# this script generates the NMFs for the vGEX of genes, vCAs of enhancers and promoters
+
+```{r, echo=F, message = F}
+library(factoextra)
+library(openxlsx)
+library(PMA)
+library(NMF)
+library(GenomicRanges)
+library(dplyr)
+source("functions_regulation.R")
+```
+
+
+# load the data
+```{r, message=F}
+folder <- 'data_from_novosparc/16dec2022_allgenes_doub_yolk_removed/'
+
+dir_out <-"output/archetypes_try/" #folder where all the output will be stored
+if (!dir.exists(dir_out)) {dir.create(dir_out)}
+
+
+# ATAC spatial digital chromatin accessibility (DCA)
+peaks_region = as.character(read.table(paste0(folder,"peaks.txt"))$V1)
+dca = read.table(paste0(folder,"sdca_5315_cells_3039_locations.txt"),row.names = peaks_region) #matrix of  locations by genomic regions
+
+
+# RNA spatial digital gene expression (DGE)
+novosparc_genes = as.character(read.table(paste0(folder,"genes.txt"))$V1)
+novosparc_dge = read.table(paste0(folder,"sdge_5315_cells_3039_locations.txt"),row.names = novosparc_genes)# matrix of locations by genes
+
+#subset also to HVG
+hvg_genes <- (read.table("input/Seurat_2000_HVG.txt"))$x
+novosparc_dge_hvg <- novosparc_dge[hvg_genes,]
+
+#ATAC annotations
+idx <- read.table("output/annotate_ATAC_peaks/peaks_all.txt",header=T)
+```
+
+# subset the genomic regions with the annotations for the ATAC peaks
+```{r, message=F, echo=F}
+rownames(idx) <- idx$name
+if (!all((rownames(dca)==rownames(idx)))){print("something seems off!")} #check if they are wrongs
+
+dca_promoters <- dca[idx$annot=="promoter",]
+dca_CDS <- dca[idx$annot=="CDS",]
+dca_enhancers <- dca[idx$annot=="enhancer",]
+dca_prom_enh <- dca[idx$annot!="CDS",]
+```
+
+
+check how many LF we wnat to take!
+```{r}
+estim.r <- nmf(novosparc_dge_hvg, rank=c(15,20,25),nrun=10, seed=123456)
+plot(estim.r)
+ggsave(filename = "novosparc_dge_hvg.pdf", device='pdf', dpi=400, useDingbats=FALSE)
+
+png("test.png")
+plot(estim.r)
+dev.off()
+
+#estim.r_promoters <- nmf(dca_promoters, rank=c(15:25),nrun=20, seed=123456)
+#plot(estim.r_promoters)
+
+estim.r_prom_enh <- nmf(dca_prom_enh, rank=c(15,20,25),nrun=10, seed=123456)
+plot(estim.r_enhancers)
+
+```
+
+
+
+
+```{r}
+# check how to  many LF fit to the for the promoters
+m <- apply(dca_promoters,1,var)
+plot(m)
+dca_promoters_sub <- dca_promoters[m> mean(m),]
+
+estim.r_prom <- nmf(dca_promoters, rank=c(10,20,25),nrun=20, seed=123456)
+plot(estim.r_prom)
+
+
+m <- apply(dca_promoters,1,var)
+plot(m)
+
+```
+
+
+
+Apply a non- negative matrix factorization in order to extract patterns/archetypes  
+from the spatial DGE and the spatial DCA
+
+```{r}
+#trz a subset of those 2000 but from the reconstructed set of 13000 genes (all)
+method= "offset"
+seed="nndsvd"
+n_factors=25
+
+#did the same for genes,genes?hvg,CDS,promoters,enhancers,enh+prom, all_peaks
+# do this in the cluster because it takes some time
+data <- dca_enhancers[1:100,] #subset if wanted
+dir_save <- paste0(dir_out,"genes_hvg")
+
+if (!dir.exists(dir_save)) {dir.create(dir_save)}
+print(dir_save)
+nmf = NMF::nmf(data,rank=n_factors, method=method,seed=seed) #create NMF object
+
+pl_embryos(nmf@fit@H,locations,nrow=5)
+
+write.table(data,file = file.path(dir_save,"input_data.txt"))
+write.table(nmf@fit@H,file = file.path(dir_save,"LatentFactors.txt"))
+write.table(nmf@fit@W,file = file.path(dir_save,"weights.txt"))
+write.table(rownames(data),file = file.path(dir_save,"features.txt"))
+
+```
+
+```{r}
+#check the LF
+pl_embryos(nmf@fit@H,locations)
+a <- nmf(dca_enhancers,seed="nndsvd", rank=10)
+```
+
+
+R version 3.6.0 (2019-04-26)
+Platform: x86_64-pc-linux-gnu (64-bit)
+Running under: Ubuntu 18.04.6 LTS
+
+Matrix products: default
+BLAS:   /usr/lib/x86_64-linux-gnu/blas/libblas.so.3.7.1
+LAPACK: /usr/lib/x86_64-linux-gnu/lapack/liblapack.so.3.7.1
+
+locale:
+ [1] LC_CTYPE=en_US.UTF-8       LC_NUMERIC=C               LC_TIME=en_US.UTF-8        LC_COLLATE=en_US.UTF-8     LC_MONETARY=en_US.UTF-8    LC_MESSAGES=en_US.UTF-8   
+ [7] LC_PAPER=en_US.UTF-8       LC_NAME=C                  LC_ADDRESS=C               LC_TELEPHONE=C             LC_MEASUREMENT=en_US.UTF-8 LC_IDENTIFICATION=C       
+
+attached base packages:
+[1] stats4    parallel  stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+ [1] dplyr_1.0.5          GenomicRanges_1.38.0 GenomeInfoDb_1.22.1  IRanges_2.20.2       S4Vectors_0.24.4     NMF_0.22.0           Biobase_2.46.0       BiocGenerics_0.32.0 
+ [9] cluster_2.1.1        rngtools_1.5         pkgmaker_0.32.2      registry_0.5-1       PMA_1.2.1            openxlsx_4.2.3       factoextra_1.0.7     ggplot2_3.3.3       
+
+loaded via a namespace (and not attached):
+ [1] tidyselect_1.1.2       xfun_0.30              purrr_0.3.4            reshape2_1.4.4         colorspace_2.0-0       vctrs_0.4.1            generics_0.1.3        
+ [8] utf8_1.2.1             rlang_1.0.3            pillar_1.8.0           glue_1.6.2             withr_2.4.1            DBI_1.1.1              RColorBrewer_1.1-2    
+[15] GenomeInfoDbData_1.2.2 foreach_1.5.1          lifecycle_1.0.0        plyr_1.8.6             zlibbioc_1.32.0        stringr_1.4.0          munsell_0.5.0         
+[22] gtable_0.3.0           zip_2.1.1              codetools_0.2-16       knitr_1.38             doParallel_1.0.16      fansi_0.4.2            Rcpp_1.0.6            
+[29] xtable_1.8-4           scales_1.2.0           XVector_0.26.0         digest_0.6.27          stringi_1.5.3          ggrepel_0.9.1          grid_3.6.0            
+[36] bitops_1.0-6           cli_3.3.0              tools_3.6.0            magrittr_2.0.1         RCurl_1.98-1.3         tibble_3.1.8           pkgconfig_2.0.3       
+[43] gridBase_0.4-7         assertthat_0.2.1       rstudioapi_0.13        iterators_1.0.13       R6_2.5.0               compiler_3.6.0        
+
