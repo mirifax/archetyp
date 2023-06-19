@@ -1,0 +1,261 @@
+---
+title: "enrich6"
+author: "Miriam"
+date: "11/22/2022"
+output: html_document
+---
+
+#### use all CRMS (annotated as promoters and enhancers ) and all weights of archetypes to weight the ATAC peaks accordingly
+
+(1) check all CRMs for TFBS hits of the 25 interesting TFs
+(2) multiply them by each archetype weight and sum them up 
+(3) check the heatmap
+
+
+```{r}
+library(PWMEnrich)
+library(MotifDb)
+library(BSgenome)
+library(PWMEnrich.Dmelanogaster.background)
+library(dplyr)
+library(ggplot2)
+source("functions_regulation.R", local = knitr::knit_global())
+library(pheatmap)
+library(universalmotif)
+library(seqLogo)
+
+dir_out <-"output/enrichment/" #folder where all the output will be stored
+if (!dir.exists(dir_out)) {dir.create(dir_out)}
+```
+
+load the data 
+```{r}
+#get the dm6 genome 
+dm_genome <- getBSgenome("BSgenome.Dmelanogaster.UCSC.dm6")
+genome <-getSeq(dm_genome, c("chr2L","chr2R","chr3L","chr3R","chr4","chrX","chrY")) 
+
+#folder<- "output/archetypes_28october2022_allgenes_rank20"
+folder <- "output/archetypes_16dec2022_allgenes_doub_yolk_removed_rank20"
+nmf_P_E <- readnmf(file.path(folder,"prom_enh"))
+acting_TFs <- read.table("output/virtual_tfbs/acting_TFs.txt",stringsAsFactors = F)
+DGE <- read.table(file.path(folder,"/genes/input_data.txt"))
+DCA <- read.table(file.path(folder,"prom_enh/input_data.txt"))
+
+MotifDb_dmelano<- query(MotifDb, "Dmelanogaster")
+
+locations = read.table('input/geometry.txt',nrows = 3039, skip = 1,col.names = c("x","y","z"))
+```
+
+
+
+specify the TFBS motifs which we use from the MotifDB
+```{r}
+#after inspecting all the TF motif entries in the Motifdb, these are the chosen one: 
+acting_TFs$MotifDB_name <- NA
+acting_TFs["sna",3] <- "Dmelanogaster-JASPAR_CORE-sna-MA0086.1"
+acting_TFs["Kr",3] <-"Dmelanogaster-jaspar2018-Kr-MA0452.2"
+acting_TFs["disco",3]<-"Dmelanogaster-FlyFactorSurvey-disco_SANGER_5_FBgn0000459"
+acting_TFs["hkb",3]<-"Dmelanogaster-jaspar2018-hkb-MA0450.1"
+acting_TFs["tll",3]<-"Dmelanogaster-jaspar2018-tll-MA0459.1"
+acting_TFs["jigr1",3]<-"Dmelanogaster-FlyFactorSurvey-jigr1_SANGER_5_FBgn0039350"
+acting_TFs["kni",3]<-"Dmelanogaster-jaspar2018-kni-MA0451.1"
+acting_TFs["slp1",3]<-"Dmelanogaster-jaspar2018-slp1-MA0458.1"
+acting_TFs["knrl",3]<-"Dmelanogaster-FlyFactorSurvey-knrl_SANGER_5_FBgn0001323"
+acting_TFs["scrt",3]<-"Dmelanogaster-FlyFactorSurvey-scrt_SOLEXA_2.5_2_FBgn0004880"
+acting_TFs["gt",3]<-"Dmelanogaster-jaspar2018-gt-MA0447.1"
+acting_TFs["slp2",3]<-"Dmelanogaster-FlyFactorSurvey-slp2_SANGER_5_FBgn0004567"
+acting_TFs["wor",3]<-"Dmelanogaster-FlyFactorSurvey-wor_SANGER_2.5_FBgn0001983"
+acting_TFs["pb",3]<-"Dmelanogaster-jaspar2018-pb-MA0238.1"
+acting_TFs["Myc",3]<-"Dmelanogaster-cisbp_1.02-M4918_1.02"
+acting_TFs["zen",3]<-"Dmelanogaster-jaspar2018-zen-MA0256.1"
+acting_TFs["prd",3]<-"Dmelanogaster-jaspar2018-prd-MA0239.1"
+acting_TFs["D",3]<-"Dmelanogaster-jaspar2018-D-MA0445.1"
+acting_TFs["fkh",3]<-"Dmelanogaster-jaspar2018-fkh-MA0446.1"
+acting_TFs["GATAe",3]<-"Dmelanogaster-FlyFactorSurvey-GATAe_SANGER_5_FBgn0038391"
+acting_TFs["ovo",3]<-"Dmelanogaster-jaspar2018-ovo-MA0126.1"
+acting_TFs["hth",3]<-"Dmelanogaster-jaspar2018-hth-MA0227.1"
+acting_TFs["oc",3]<-"Dmelanogaster-jaspar2018-oc-MA0234.1"
+acting_TFs["bcd",3]<-"Dmelanogaster-jaspar2018-bcd-MA0212.1"
+acting_TFs["twi",3]<-"Dmelanogaster-jaspar2018-twi-MA0249.1"
+
+```
+
+#plot the used motifs
+```{r}
+# list of all the 25 TFs with their motifs
+Motifdb_acting_TF <- sapply(acting_TFs$MotifDB_name, function(x)  MotifDb_dmelano[grep(x,names(MotifDb_dmelano))])
+PPMs <- list()
+
+for (i in (1:length(Motifdb_acting_TF))){
+  #print(i)
+  motif <- (Motifdb_acting_TF[[i]][[1]])
+  PPMs[[i]] <- motif
+}
+names(PPMs) <- rownames(acting_TFs)
+  
+
+#folder <- "output/figures/fig_..."
+for (i in (1:length(PPMs))){
+  #pdf(paste0(names(PPMs)[i],"_logo_motif.pdf"))
+  seqLogo(PPMs[[i]])
+  #dev.off()
+}
+
+
+```
+
+```{r}
+# compute the PWM with specific background nucleotides for the fly 
+data(MotifDb.Dmel)
+nt_freqs <-MotifDb.Dmel[1]$M0111_1.02$prior.params
+
+
+# list of all the 25 TFs with their motifs in universalmotif style, convert to PWM based on the background freqs
+Motifdb_acting_TF <- sapply(acting_TFs$MotifDB_name, function(x)  convert_motifs(MotifDb_dmelano[grep(x,names(MotifDb_dmelano))])[[1]])
+for (i in (1:length(Motifdb_acting_TF))){
+  Motifdb_acting_TF[[i]]['bkg'] <- nt_freqs
+  Motifdb_acting_TF[[i]]<- convert_type(Motifdb_acting_TF[[i]],type="PWM")
+}
+
+```
+
+
+
+```{r}
+#get the sum of motifs in all CRMS
+CRMS_use <- rownames(DCA)
+
+observed <- data.frame(row.names = rownames(acting_TFs))
+observed[,1:length(CRMS_use)] <- NaN
+
+
+  a <- CRMS_use
+  gr_a <-  makeGRangesFromDataFrame(reshape2::colsplit(a,"-",names = c("chr","start","stop")))
+  a.seq <- getSeq(genome, gr_a)
+  
+  for (j in (1:length(Motifdb_acting_TF))){
+    hits <- lapply(a.seq, function(s) matchPWM(Motifdb_acting_TF[[j]]['motif'],s, min.score="85%")) 
+    m <- sapply(hits, length)
+    observed[j,] <- m
+  }
+  
+observed <- t(observed)
+rownames(observed) <- idx[which(idx$promoters |idx$enhancers),]$name
+
+```
+
+```{r}
+#scale the hits 
+observed_scaled <- scale(observed)
+
+# now multiply the NMF weights on the scaled motifhits in each CRM  
+
+test1 <- apply(observed_scaled * nmf_P_E$weights$V1,2,sum)
+test3 <- apply(observed_scaled * nmf_P_E$weights$V3,2,sum)
+
+test <- apply(nmf_P_E$weights,2,function(x) apply(observed_scaled*x,2,sum))
+
+test_scale <- t(scale(t(test)))
+myColor <- colorRampPalette(c("blue", "white", "red"))(paletteLength)
+myBreaks <- c(seq(min(test_scale), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(test_scale)/paletteLength, max(test_scale), length.out=floor(paletteLength/2)))
+
+pdf(file.path(dir_out,paste0("heatmap_weighted_observed.pdf")))
+pheatmap(test_scale,color=myColor, breaks=myBreaks)
+dev.off()
+
+```
+
+```{r}
+#taking just the subset of enhancers or promoters
+idx <- read.table("output/annotate_ATAC_peaks/peaks_all.txt",header=T,stringsAsFactors = F)
+idx_prom <- idx[idx$annot=="promoter",]
+
+#subset to enhancers
+observed_enh <- observed[-which(rownames(observed) %in% idx_prom$name),]
+weights_enh <- nmf_P_E$weights[-which(rownames(nmf_P_E$weights) %in% idx_prom$name),]
+
+observed_prom <- observed[which(rownames(observed) %in% idx_prom$name),]
+weights_prom <- nmf_P_E$weights[which(rownames(nmf_P_E$weights) %in% idx_prom$name),]
+
+#scale the hits 
+observed_enh_scaled <- scale(observed_enh)
+observed_prom_scaled <- scale(observed_prom)
+
+# now multiply the NMF weights on the scaled motifhits in each CRM  
+
+observed_weighted_enh <- apply(weights_enh,2,function(x) apply(observed_enh_scaled*x,2,sum))
+observed_weighted_prom <- apply(weights_prom,2,function(x) apply(observed_prom_scaled*x,2,sum))
+
+#plot heatmap enhancers
+test <- t(scale(t(observed_weighted_enh)))
+myBreaks <- c(seq(min(test), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(test)/paletteLength, max(test), length.out=floor(paletteLength/2)))
+pdf(file.path(dir_out,paste0("heatmap_weighted_observed_enhancers.pdf")))
+pheatmap(test,color=myColor, breaks=myBreaks)
+dev.off()
+
+test <- t(scale(t(observed_weighted_prom)))
+myBreaks <- c(seq(min(test_scale), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(test_scale)/paletteLength, max(test_scale), length.out=floor(paletteLength/2)))
+
+pdf(file.path(dir_out,paste0("heatmap_weighted_observed_promoters.pdf")))
+pheatmap(test,color=myColor, breaks=myBreaks)
+dev.off()
+```
+
+
+
+
+
+#save the data 
+```{r}
+#save CRMS used
+capture.output(CRMs_per_Arche, file = file.path(dir_out, "CRMs_per_Archetype_based_NMFweights.txt"))  
+
+#save expected and observed values 
+write.table(expected, file.path(dir_out,"expected_motifs.txt"))
+write.table(observed, file.path(dir_out,"observed_motifs.txt"))
+write.table(observed_pseudocount, file.path(dir_out,"observed_pseudocount_motifs.txt"))
+```
+
+
+
+R version 3.6.0 (2019-04-26)
+Platform: x86_64-pc-linux-gnu (64-bit)
+Running under: Ubuntu 18.04.6 LTS
+
+Matrix products: default
+BLAS:   /usr/lib/x86_64-linux-gnu/blas/libblas.so.3.7.1
+LAPACK: /usr/lib/x86_64-linux-gnu/lapack/liblapack.so.3.7.1
+
+locale:
+ [1] LC_CTYPE=en_US.UTF-8       LC_NUMERIC=C               LC_TIME=en_US.UTF-8        LC_COLLATE=en_US.UTF-8     LC_MONETARY=en_US.UTF-8    LC_MESSAGES=en_US.UTF-8   
+ [7] LC_PAPER=en_US.UTF-8       LC_NAME=C                  LC_ADDRESS=C               LC_TELEPHONE=C             LC_MEASUREMENT=en_US.UTF-8 LC_IDENTIFICATION=C       
+
+attached base packages:
+ [1] stats4    parallel  grid      stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+ [1] seqLogo_1.52.0                            universalmotif_1.4.10                     pheatmap_1.0.12                           ggplot2_3.3.3                            
+ [5] dplyr_1.0.5                               PWMEnrich.Dmelanogaster.background_4.20.0 BSgenome_1.54.0                           rtracklayer_1.46.0                       
+ [9] GenomicRanges_1.38.0                      GenomeInfoDb_1.22.1                       MotifDb_1.28.0                            PWMEnrich_4.22.0                         
+[13] Biostrings_2.54.0                         XVector_0.26.0                            IRanges_2.20.2                            S4Vectors_0.24.4                         
+[17] BiocGenerics_0.32.0                      
+
+loaded via a namespace (and not attached):
+ [1] Biobase_2.46.0              tidyr_1.1.3                 jsonlite_1.7.2              gtools_3.8.2                Rdpack_2.1.1                assertthat_0.2.1           
+ [7] BiocManager_1.30.10         rvcheck_0.1.8               GenomeInfoDbData_1.2.2      Rsamtools_2.2.3             yaml_2.2.1                  pillar_1.8.0               
+[13] lattice_0.20-41             glue_1.6.2                  RColorBrewer_1.1-2          rbibutils_2.0               colorspace_2.0-0            Matrix_1.3-2               
+[19] plyr_1.8.6                  XML_3.99-0.3                pkgconfig_2.0.3             ggseqlogo_0.1               zlibbioc_1.32.0             purrr_0.3.4                
+[25] tidytree_0.3.3              scales_1.2.0                processx_3.5.0              gdata_2.18.0                BiocParallel_1.20.1         tibble_3.1.8               
+[31] generics_0.1.3              withr_2.4.1                 SummarizedExperiment_1.16.1 lazyeval_0.2.2              cli_3.3.0                   splitstackshape_1.4.8      
+[37] magrittr_2.0.1              ps_1.6.0                    fansi_0.4.2                 nlme_3.1-152                MASS_7.3-53.1               tools_3.6.0                
+[43] data.table_1.14.0           lifecycle_1.0.0             matrixStats_0.58.0          stringr_1.4.0               ggtree_2.0.4                munsell_0.5.0              
+[49] DelayedArray_0.12.3         compiler_3.6.0              evd_2.3-6.1                 rlang_1.0.3                 RCurl_1.98-1.3              rstudioapi_0.13            
+[55] bitops_1.0-6                gtable_0.3.0                DBI_1.1.1                   reshape2_1.4.4              R6_2.5.0                    GenomicAlignments_1.22.1   
+[61] knitr_1.38                  utf8_1.2.1                  treeio_1.10.0               ape_5.4-1                   stringi_1.5.3               Rcpp_1.0.6                 
+[67] vctrs_0.4.1                 tidyselect_1.1.2            xfun_0.30                  
+> 
+
+

@@ -1,0 +1,261 @@
+---
+title: "TF_to_CRM"
+author: "Miriam"
+date: "7/6/2022 changed 2 november 2022"
+output: html_document
+---
+
+# this script just generates the data 
+
+# (1) get a dataset of TFs and their PWMs 
+# (2) scan all genomic regions against those motifs ( enhancers+promoters) 
+# (3) have a virtual TFBS pattern for each TF
+
+
+load the libraries
+```{r, warning=F, message=F} 
+library(Biostrings)
+library(glmnet)
+library(GenomicRanges)
+library(rtracklayer)
+library(dplyr)
+library(ggplot2)
+library(MotifDb)
+library(TFBSTools)
+library(PWMEnrich)
+library(seqLogo)
+library(BSgenome)
+library(ggVennDiagram)
+library(NMF)
+library(plotly)
+```
+
+load the data
+```{r, echo=F}
+#input folder
+folder <- "output/archetypes_16dec2022_allgenes_doub_yolk_removed"
+
+#output folder
+out_dir <-"output/virtual_tfbs" #where to save all
+if(!exists(out_dir)){dir.create(out_dir)}
+
+#DGE
+genes = read.table(file.path( folder,"genes/features.txt"),stringsAsFactors = F)$x
+DGE = read.table(file.path(folder,"genes/input_data.txt"))
+
+#DCA
+peaks <- read.table(file.path(folder,"prom_enh/features.txt"),stringsAsFactors = F)$x
+g_peaks <- makeGRangesFromDataFrame(reshape2::colsplit(peaks,"-",names = c("chr","start","stop")))
+DCA <- read.table(file.path(folder,"prom_enh/input_data.txt"))
+if (!all(rownames(DCA)==peaks)){print("inconsistency in peaks!!!")}
+
+#loacations for the cells
+locations = read.table('input/geometry.txt',nrows = 3039, skip = 1,col.names = c("x","y","z"))
+
+#get the dm6 genome 
+dm_genome <- getBSgenome("BSgenome.Dmelanogaster.UCSC.dm6")
+genome <-getSeq(dm_genome, c("chr2L","chr2R","chr3L","chr3R","chr4","chrX","chrY")) 
+```
+
+
+## 1 
+GET list of TFs
+```{r}
+#load carmens TF database
+TF_steinaert <- read.table("input/carmenBravo/levels_gene_name_snapshots_motif-v10-nr.flybase_flymine.tsv",colClasses = c("character","character"))[,2:3]
+colnames(TF_steinaert) <- c("geneName","gene_ID")
+
+#subset to ones expressed in the DGE
+TF_list <- TF_steinaert[TF_steinaert$gene_ID %in% genes,]
+```
+
+
+## 2 
+get a hitlist of all TFs against all the CRM (16k)
+```{r}
+#generate an empty TF to CRM matrix 
+CRM_seq <- BSgenome::getSeq(genome, g_peaks) #get sequences
+MotifDb_dmel<- query(MotifDb, "Dmelanogaster")
+
+#loop over all PWMs there are for each TF
+tfbs_hits <- matrix(nrow= length(g_peaks),ncol = length(rownames(TF_list))) #create an empty matrix
+colnames(tfbs_hits) <- TF_list$geneName #with the correct colnames
+rownames(tfbs_hits) <- g_peaks$name
+check_manually <- c() #list for all the errors
+n_motifs <-rep(NA, dim(TF_list)[1])
+n_motifs_used <-rep(NA, dim(TF_list)[1])
+
+for (tf in (1:dim(TF_list)[1])){
+  print(tf)
+  TF_BS <- MotifDb_dmel[grep(paste0('^',TF_list[tf,1],'$'), values(MotifDb_dmel)$geneSymbol, ignore.case=T, value=F)]
+  
+  # if no hits in MOtifDB check the FBgn name or ut in list to check later
+  if (length(TF_BS)==0) { 
+    TF_BS <- query(MotifDb_dmel, TF_list[tf,2])
+    if (length(TF_BS)==0){
+      check_manually <- c(check_manually,TF_list[tf,2])
+      n_motifs[tf] <- length(TF_BS)
+      next
+    }
+  }
+  
+  n_motifs[tf] <- length(TF_BS) #save how many motifs that TF actually has
+  counts <- list() #create empty count list
+    
+  for (i in seq_along(TF_BS)){
+      hits <- lapply(CRM_seq, function(s) matchPWM(as.matrix(TF_BS[[i]]),s, min.score="85%")) #should i checked for complementary - no already implemented
+      counts_hits <- sapply(hits, length) #get the hits per CRM
+      counts[[i]] <- counts_hits
+  }
+  
+  #if the have exactly the same hits, most sure the motifs are doubled
+  if (any(duplicated(counts))) {
+    counts<- counts[duplicated(counts)==FALSE]
+  }
+  
+  n_motifs_used[tf] <- length(counts)
+  sum_counts <- Reduce("+",counts) #sum up all the motifs ( of there are different ones)
+  #sum_counts_div <- sum_counts/length(counts) #divide by number of motif, so it is comparable!
+  tfbs_hits[,tf] <- sum_counts
+  
+  if (colnames(tfbs_hits)[tf] == TF_list$geneName[tf]) {
+      print(paste(TF_list[tf,],"is done"))
+  }
+  
+}
+
+#add motifs and number of used motifs to it 
+TF_list$nmotifs_MotifDB <- n_motifs
+TF_list$nmotifs_used_MotifDB <- n_motifs_used
+
+
+TF_list_all <- TF_list
+TF_list <- TF_list[TF_list$nmotifs_MotifDB != 0,] #onlz keep TF with a motif in MotifDB
+rownames(TF_list) <- NULL
+
+tfbs_hits <- tfbs_hits[,!is.na(tfbs_hits[1,])]
+
+#scale the hits per TF
+tfbs_hits_scaled <- scale(tfbs_hits, center = T)
+
+#safe the TF_list and the table
+write.table(TF_list_all,file.path(out_dir,"TF_list_all.txt"))
+write.table(TF_list,file.path(out_dir,"TF_list.txt"))
+write.table(tfbs_hits,file.path(out_dir,"tfbs_hits.txt"))
+write.table(tfbs_hits_scaled,file.path(out_dir,"tfbs_hits_scaled.txt"))
+write.table(rownames(tfbs_hits), file.path(out_dir, "features.txt"))
+```
+
+
+
+
+check whether the GEX of all TFs can also be reduced into archetypes ? 
+```{r}
+nmf_TFs=NMF::nmf(DGE[TF_list$gene_ID,],rank=20, method="offset",seed=as.character("nndsvd"))
+
+png(file= file.path(out_dir,"TFs_LatentFactors.png"))
+p <- pl_embryos(nmf_TFs@fit@H,coordinates = locations,title = paste("NMF of", dim(TF_list)[1], "TFs"))
+p
+dev.off()
+```
+
+#create response accessibility
+
+```{r}
+#create the virtual transcrption-factor-binding-site pattern for every TF
+TF_list$geneName <- as.character(TF_list$geneName)
+#do it just for one
+#tfbs_sna  <-DCA*tfbs_hits_scaled[,"twi"]
+#virtual_sna<- apply(tfbs_sna,2,sum)
+#pl_embryos(virtual_sna,locations)
+
+virtual_tfbs <- matrix(ncol= 3039,nrow = length(rownames(TF_list)))
+rownames(virtual_tfbs) <- TF_list$geneName
+for (tf in (1:length(TF_list$geneName))){
+  tfbs_product <-tfbs_hits_scaled[,TF_list$geneName[tf]]*DCA
+  virtual_tfbs[tf,]<- apply(tfbs_product,2,sum)
+}
+
+#check the correlation between the virtual tfbs and the GEX to inspect whether this could be an enhancer or suppressor
+TF_list_ad <- TF_list[,c(1:2)]
+TF_list_ad$gene_ID <- as.character(TF_list_ad$gene_ID)
+cor_virtual_tfbs_GEX <- data.frame(row.names = rownames(virtual_tfbs)) #create emptpty dataframe
+cor_virtual_tfbs_GEX$cor <- NaN
+for (tf in TF_list$geneName){
+  cor_virtual_tfbs_GEX[tf,] <- cor(as.numeric(DGE[translateG(tf,TF_list_ad),]),virtual_tfbs[tf,],method = "pearson") 
+}
+
+#save those
+write.table(virtual_tfbs, file.path(out_dir,"virtual_tfbs.txt"))
+write.table(cor_virtual_tfbs_GEX, file.path(out_dir,"cor_virtual_tfbs_GEX.txt"))
+```
+
+TF which seem to affect chromatin 
+```{r}
+# save the TFs whih could act on chromatin based on their anti(correlation) with their geneexpression pattern 
+cor.ordered <- as.data.frame(cor_virtual_tfbs_GEX[order(cor_virtual_tfbs_GEX$cor),,drop=F])
+acting_TFs <- cor.ordered[cor.ordered$cor>0.6 | cor.ordered$cor< -0.6,,drop=F]
+acting_TFs$fbgn <- translateG(rownames(acting_TFs),TF_list)
+
+write.table(acting_TFs, file.path(out_dir,"acting_TFs.txt"))
+
+```
+
+```{r}
+#plot examples
+test <- 21
+#test<- acting_TFs$fbgn[1]
+pl_embryos(DGE[acting_TFs$fbgn[test],], locations)
+pl_embryos(virtual_tfbs[rownames(acting_TFs)[test],], locations,type="ATAC")
+
+#check motifs
+p_list <- list()
+
+m_tmp <- MotifDb_dmel[grep(paste0('^',rownames(acting_TFs)[test],'$'), values(MotifDb_dmel)$geneSymbol, ignore.case=T, value=F)]
+print(m_tmp)
+for (j in 1:length(m_tmp)){
+    seqLogo(m_tmp[[j]])
+}
+
+```
+
+
+
+R version 3.6.0 (2019-04-26)
+Platform: x86_64-pc-linux-gnu (64-bit)
+Running under: Ubuntu 18.04.6 LTS
+
+Matrix products: default
+BLAS:   /usr/lib/x86_64-linux-gnu/blas/libblas.so.3.7.1
+LAPACK: /usr/lib/x86_64-linux-gnu/lapack/liblapack.so.3.7.1
+
+locale:
+ [1] LC_CTYPE=en_US.UTF-8       LC_NUMERIC=C               LC_TIME=en_US.UTF-8        LC_COLLATE=en_US.UTF-8     LC_MONETARY=en_US.UTF-8    LC_MESSAGES=en_US.UTF-8   
+ [7] LC_PAPER=en_US.UTF-8       LC_NAME=C                  LC_ADDRESS=C               LC_TELEPHONE=C             LC_MEASUREMENT=en_US.UTF-8 LC_IDENTIFICATION=C       
+
+attached base packages:
+ [1] grid      stats4    parallel  stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+ [1] plotly_4.9.3         NMF_0.22.0           Biobase_2.46.0       cluster_2.1.1        rngtools_1.5         pkgmaker_0.32.2      registry_0.5-1       ggVennDiagram_1.2.1 
+ [9] BSgenome_1.54.0      seqLogo_1.52.0       PWMEnrich_4.22.0     TFBSTools_1.24.0     MotifDb_1.28.0       ggplot2_3.3.3        dplyr_1.0.5          rtracklayer_1.46.0  
+[17] GenomicRanges_1.38.0 GenomeInfoDb_1.22.1  glmnet_4.1-1         Matrix_1.3-2         Biostrings_2.54.0    XVector_0.26.0       IRanges_2.20.2       S4Vectors_0.24.4    
+[25] BiocGenerics_0.32.0 
+
+loaded via a namespace (and not attached):
+ [1] colorspace_2.0-0            ellipsis_0.3.2              evd_2.3-6.1                 rstudioapi_0.13             bit64_4.0.5                 AnnotationDbi_1.48.0       
+ [7] fansi_0.4.2                 codetools_0.2-16            splines_3.6.0               R.methodsS3_1.8.1           doParallel_1.0.16           cachem_1.0.4               
+[13] knitr_1.38                  jsonlite_1.7.2              splitstackshape_1.4.8       Rsamtools_2.2.3             gridBase_0.4-7              annotate_1.64.0            
+[19] GO.db_3.10.0                png_0.1-7                   R.oo_1.24.0                 readr_1.4.0                 compiler_3.6.0              httr_1.4.2                 
+[25] assertthat_0.2.1            fastmap_1.1.0               lazyeval_0.2.2              cli_3.3.0                   htmltools_0.5.1.1           tools_3.6.0                
+[31] gtable_0.3.0                glue_1.6.2                  TFMPvalue_0.0.8             GenomeInfoDbData_1.2.2      reshape2_1.4.4              Rcpp_1.0.6                 
+[37] vctrs_0.4.1                 gdata_2.18.0                iterators_1.0.13            xfun_0.30                   CNEr_1.22.0                 stringr_1.4.0              
+[43] lifecycle_1.0.0             poweRlaw_0.70.6             gtools_3.8.2                XML_3.99-0.3                zlibbioc_1.32.0             scales_1.2.0               
+[49] hms_1.0.0                   SummarizedExperiment_1.16.1 RColorBrewer_1.1-2          memoise_2.0.0               stringi_1.5.3               RSQLite_2.2.4              
+[55] foreach_1.5.1               caTools_1.18.1              BiocParallel_1.20.1         shape_1.4.5                 rlang_1.0.3                 pkgconfig_2.0.3            
+[61] matrixStats_0.58.0          bitops_1.0-6                pracma_2.3.3                lattice_0.20-41             purrr_0.3.4                 GenomicAlignments_1.22.1   
+[67] htmlwidgets_1.5.3           bit_4.0.4                   tidyselect_1.1.2            plyr_1.8.6                  magrittr_2.0.1              R6_2.5.0                   
+[73] generics_0.1.3              DelayedArray_0.12.3         DBI_1.1.1                   pillar_1.8.0                withr_2.4.1                 survival_3.2-10            
+[79] KEGGREST_1.26.1             RCurl_1.98-1.3              tibble_3.1.8                utf8_1.2.1                  RVenn_1.1.0                 data.table_1.14.0          
+[85] blob_1.2.1                  digest_0.6.27               xtable_1.8-4                tidyr_1.1.3                 R.utils_2.10.1              munsell_0.5.0              
+[91] DirichletMultinomial_1.28.0 viridisLite_0.3.0    
