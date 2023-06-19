@@ -1,0 +1,327 @@
+---
+title: "Get putative enhancers (Enriched Annotations - Peaks vs. Whole Genome)"
+author: "Miriam"
+date: "7/14/2020, updated 17th August 2020, 24th August,7th Sept,6th Nov,10 Dec, 2 november  2022"
+output: html_document
+---
+
+this schript is updated to new data
+This script should do:  
+(1) define new annotation definitions, then make a plot to look where the whole genome against the peaks re enriched (in which of the new annotations)  
+(2) seperate the peaks into putative promoters, putative enhancers and CDS
+(3) store that data  
+
+
+###  (1) Find out which genetic regions are enriched in the DHS peaks compared to the whole genome   
+```{r,echo=F,message=F, warning=F}
+#read in the packages
+library(GenomicRanges)
+library(rtracklayer)
+library(ChIPpeakAnno)
+library(genomation)
+library(BSgenome)
+library(seqinr)
+library(plyranges)
+library(Biostrings)
+library(reshape)
+library(ggplot2)
+library(knitr)
+library(GenomicScores)
+source("functions_regulation.R")
+```
+
+
+```{r,echo=F,message=F, warning=F}
+
+#read in the files 
+peaks <- read.table("data_from_novosparc/16dec2022_allgenes_doub_yolk_removed/peaks.txt",stringsAsFactors = F)
+peaks <- makeGRangesFromDataFrame(reshape2::colsplit(peaks$V1,"-",names = c("chr","start","stop"))) 
+
+#peaks <- readBed("data_for_novosparc/atac/atac_ranges.bed")
+gtf <- import.gff("input/Drosophila_melanogaster.BDGP6.28.100.chr.gtf") #
+fa <-"input/Drosophila_melanogaster.BDGP6.28.dna_rm.toplevel_nowhite.fa"
+
+#which genes are expressed?
+genes_exp <- read.table("data_from_novosparc/16dec2022_allgenes_doub_yolk_removed/genes.txt",stringsAsFactors = F)$V1
+
+dir_out <-"output/annotate_ATAC_peaks/" #folder where all the output will be stored
+if (!dir.exists(dir_out)) {dir.create(dir_out)}
+```
+
+
+```{r,echo=F,message=F, warning=F}
+#subset to main chromosoms and feed the length information of the fasta file into the gtf file
+gtf <- keepStandardChromosomes(gtf,pruning.mode = "coarse")
+fasta<- seqinr::read.fasta( file = fa,seqtype = "DNA")
+fasta<- fasta[1:7]
+seqinfo(gtf)@seqlengths <-getLength(fasta) # add the chromosom length to the gtf file
+
+seqlevelsStyle(peaks)<- "NCBI"
+```
+
+
+Since we dont want to compute bp's twice, we define our regions as the following and only stand-UNspecific: 
+
+- "CDSplus" = [union of gtf:CDS and gtf:stop-codons and gtf:tRNA and gtf:snRNA and gtf:snoRNA]  
+- "5'-UTR" = union of ([gtf:genes - "CDS"] overlap [gtf:5'-UTR])  
+- "3'-UTR = union of ([gtf:genes - "CDS"] overlap [gtf: 3'-UTR])  
+- "introns" = [gtf:genes] - union of ("CDS" + "5'-UTR" + "3'-UTR") (also pre-miRNA, ncRNA, lncRNA andpseudogenes are included here)  
+- "intergenic" = [genom - masked] - [gtf:genes]
+- "promoters" = first transcribed bp =/- 100 bp
+- "intron_1" = the intron closest to the fiveprime end  
+
+```{r,echo=F,warning=F}
+#compute the "new" definitions for the gtf file annotations
+masked_bps <-vmatchPattern("N",readDNAStringSet(fa, format = "fasta")[1:7])#get masked regions
+MASKED <- GRanges(seqnames=NULL,ranges=NULL,strand=NULL)
+for (i in names(masked_bps)){ 
+  MASKED = append(MASKED, GRanges(seqnames = i,ranges = reduce(masked_bps[[i]]),strand = "*"))
+} 
+
+GENOM_wMA <- GRanges(seqnames=names(fasta),ranges=IRanges(start = rep(1,7), end = getLength(fasta) ))
+GENOM <- setdiff(GENOM_wMA, MASKED) #the finally used genom witout the repetivie regions (cut out the masked)
+GENES <- setdiff(reduce_ranges(gtf[gtf$type=="gene"]),MASKED) # there are also masked regions in the introns
+INTERGENIC <- setdiff(GENOM, GENES)
+CDS <-setdiff(reduce_ranges(gtf[gtf$type=="stop_codon" | gtf$type=="CDS" | gtf$type=="snoRNA" | gtf$type=="tRNA" | gtf$type=="snRNA"]),MASKED)
+FIVEPRIME <-pintersect(findOverlapPairs(reduce_ranges(gtf[gtf$type=="five_prime_utr"]),GenomicRanges::setdiff(GENES,CDS)))
+THREEPRIME <-pintersect(findOverlapPairs(reduce_ranges(gtf[gtf$type=="three_prime_utr"]),setdiff(GENES,append(CDS,FIVEPRIME))))
+INTRON <- reduce_ranges(GenomicRanges::setdiff(GENES,reduce(append(append(CDS,FIVEPRIME),THREEPRIME))))
+  
+#additionally our definition of promoters (which is the first base of TSS =/- 100 bp)
+fiveprimes <- gtf[gtf$type=="five_prime_utr"]
+id <- fiveprimes$transcript_id; index<- logical(length(id)); last<-""
+for (i in 1:length(id)){
+  if (id[i] == last){last<-id[i]} else if (id[i] != last){index[i]<-TRUE; last<-id[i]}
+} 
+fiveprimes <- fiveprimes[index]
+PROMOTERS <- reduce_ranges(flank(fiveprimes, 100,start= T,both=T))
+
+#extra : look intro whether the first introns are enriched ( do this by taking last base of (first) 5'-UTR and then see if within 3 bp (start))
+#the introns which split the 5'-UTRs
+a <- fiveprimes
+b <-resize(a,1,fix="end")
+intron_a<-subsetByOverlaps(INTRON, b,maxgap = 0)
+#and the ones which are behind the first CDS
+a <- fiveprimes
+b <-resize(a,1,fix="end")
+c <- subsetByOverlaps(CDS, b,maxgap = 0)
+intron_b <- subsetByOverlaps(INTRON,c ,maxgap = 0)
+INTRON_1<- append(intron_a,intron_b) # all introns which are closest to the 5'-primeend
+
+
+#print progress:
+an_groups <- c("GENOM","GENES","CDS","FIVEPRIME","THREEPRIME","INTRON","INTERGENIC","PROMOTERS","INTRON_1")
+for (i in (1:length(an_groups))){
+  print(paste("The annotation group:",an_groups[i], "has",length(get(an_groups[i])),"objects"))
+}
+
+#write_bed(CDS, file=paste0(dir_out,"CDS.bed"))
+#write_bed(INTERGENIC, file=paste0(dir_out,"intergenic.bed"))
+#write_bed(PROMOTERS, file=paste0(dir_out,"promoters.bed"))
+#write_bed(FIVEPRIME, file=paste0(dir_out,"fiveprime.bed"))
+#write_bed(THREEPRIME, file=paste0(dir_out,"threeprime.bed"))
+
+```
+
+Compute the number of basepairs for each annotation group 
+```{r,echo=F}
+#make a summarytable
+TAB <-data.frame(matrix(nrow= 4, ncol=8))
+row.names(TAB) = c("genome_dm6","genome_percent","peaks","peaks_percent")
+colnames(TAB) = c("bp","CDS","intron","intergenic","fiveprime","threeprime","promoters","intron_1")
+
+#compute the sum of bp for the whole genome
+TAB["genome_dm6","bp"] <- sum(width(GENOM))
+TAB["genome_dm6","CDS"] <- sum(width(CDS))
+TAB["genome_dm6","intron"] <- sum(width(INTRON))
+TAB["genome_dm6","intergenic"] <-sum(width(INTERGENIC))
+TAB["genome_dm6","fiveprime"] <- sum(width(FIVEPRIME))
+TAB["genome_dm6","threeprime"] <-  sum(width(THREEPRIME))
+TAB["genome_dm6","promoters"] <-  sum(width(PROMOTERS))
+TAB["genome_dm6","intron_1"] <-  sum(width(INTRON_1))
+
+#now calculate where the peaks fall in but only the overlapping bp 
+TAB["peaks","bp"]<-sum(width(peaks))
+
+#bp -peaks in CDS (only the overlap!)
+TAB["peaks","CDS"] <- sum(width(pintersect(findOverlapPairs(peaks,CDS))))
+TAB["peaks","intergenic"] <- sum(sum(width(peaks))-sum(width(pintersect(findOverlapPairs(peaks,GENES)))))
+TAB["peaks","fiveprime"] <- sum(width(pintersect(findOverlapPairs(peaks,FIVEPRIME))))
+TAB["peaks","threeprime"] <- sum(width(pintersect(findOverlapPairs(peaks,THREEPRIME))))
+TAB["peaks","intron"] <- sum(width(pintersect(findOverlapPairs(peaks,INTRON))))
+TAB["peaks","promoters"] <- sum(width(pintersect(findOverlapPairs(peaks,PROMOTERS))))
+TAB["peaks","intron_1"] <- sum(width(pintersect(findOverlapPairs(peaks,INTRON_1))))
+
+#compute the percentages
+for (i in (1:dim(TAB)[2])){
+  TAB["genome_percent",i] <- (TAB["genome_dm6",i]/TAB["genome_dm6","bp"])*100
+}#for whole genome
+
+for (i in (1:dim(TAB)[2])){
+  TAB["peaks_percent",i] <- (TAB["peaks",i]/TAB["peaks","bp"])*100
+}# for peaks
+
+#check if correct
+if (sum(TAB[1,2:6])== TAB[1,1]){
+  print("TRUE: intron + CDS + intergenic + fiveprime + threeprime summs up to 100!")
+} else {print("something does not match up");print(sum(TAB[1,2:6])); print(TAB[1,1])}
+
+if (sum(TAB[3,2:6])== TAB[3,1]){
+  print("TRUE: intron + CDS + intergenic + fiveprime + threeprime summs up to 100!")
+  print(paste(round(TAB[3,1]/TAB[1,1]*100,2),"% of the unmasked genome is covered by the peaks we found"))
+  } else {print("something does not match up");print(sum(TAB[3,2:6])); print(TAB[3,1])}
+
+#print table
+kable(round(TAB,1),caption = "Numbers of bp for genome vs ATAC peaks")
+```
+
+
+## Figure:
+
+- CDS + intron + intergenic + fiveprime + threeprime = whole genome  
+- whole genome = 137 Mio. bp - 29 Mio. masked regions  
+- the promoters are our own defintion as : first base of fiveprime =/- 100bp  
+- intron_1 stands for the subset of introns, which are the closest to the first base of fiveprime  
+
+```{r,echo=F}
+barplot(as.matrix(TAB[c(2,4),c(2:8)]),beside=T,main = "Basepair count peaks vs whole genome", las=2,col = c("green","blue"))
+legend("topright",c("Genome", "ATAC peaks"),fill = c("green","blue"))
+
+
+```
+
+
+
+## (2) seperate the peaks into putative promoters, putative enhancer
+
+divide the peaks into  
+
+- putative promoters: min. 100 bp overlap with PROMOTERS (first transcript bp +/- 100)  
+- CDS: min 100bp overlap with CDS
+- putative enhancers: no overlap with PROMOTERS or CDS
+
+
+```{r,echo=F}
+#get a granges with indexes of 
+peaks_t <- peaks
+
+peaks_t$promoters <- FALSE
+peaks_t$promoters[queryHits(findOverlaps(peaks_t,PROMOTERS,minoverlap = 100L))] <- TRUE
+peaks_t$CDS <- FALSE
+peaks_t$CDS[queryHits(findOverlaps(peaks_t,CDS,minoverlap = 100L))] <- TRUE
+peaks_t$enhancers <- FALSE
+#peaks$enhancers[queryHits(findOverlaps(peaks,not_CDS, minoverlap = 100L))]  <- TRUE
+peaks_t$enhancers[! (peaks_t$promoters | peaks_t$CDS )] <- TRUE #get all which ar not yet defined
+seqlevelsStyle(peaks_t)<-"UCSC"
+
+#give the name
+peaks_t$peak_ID <- paste0("peak_",c(1:length(peaks_t)))
+```
+
+### lets add some meta info to the peaks
+```{r}
+
+### give them a fake pseudo bulk score from the bigwigs
+peaks_t$pseudo_score <- max_per_bigwig_peak(bigwigfile1 = "input/multiome/atac_cut_sites_sampleA.bigwig",bigwigfile2 = "input/multiome/atac_cut_sites_sampleB.bigwig",granges = peaks_t)
+
+## overlaps with Vienna Tiles from the Stark lab 
+VT_CAD4 <- import.bed("input/CAD4_plus_vienna_dm6.bed") #load the Vienna Tile
+VT <- VT_CAD4[grep("^VT",VT_CAD4$name),]
+peaks_t$overVT <- FALSE #generate a column
+peaks_t$overVT[overlapsAny(peaks_t,VT)] <- TRUE
+hits <- findOverlaps(peaks_t,VT) #overlap over 90% and which VT
+overlaps <- pintersect(peaks_t[queryHits(hits)], VT[subjectHits(hits)])
+percentOverlap <- width(overlaps) / width(peaks_t[queryHits(hits)])
+hits_90 <- hits[percentOverlap >0.9] 
+peaks_t$overVT_90 <- "NO" #add it to the table
+peaks_t$overVT_90[queryHits(hits_90)] <- VT$name[subjectHits(hits_90)] #add the VT name
+
+
+#add the nearest Genes 
+seqlevelsStyle(gtf) <- "UCSC"
+five_prime <- gtf[gtf$type=="five_prime_utr",] #subset to startcodons 
+five_prime_availGenes <- five_prime[five_prime$gene_id %in% genes_exp,]
+
+#add the nearest Gene
+peaks_t$closGene1 <- five_prime$gene_id[GenomicRanges::nearest(peaks_t,five_prime)] #add the 1
+peaks_t$closGene1_name <- five_prime$gene_name[GenomicRanges::nearest(peaks_t,five_prime)] #add the name
+
+peaks_t$closGene2 <- c("id") #make an empty column for 2
+peaks_t$closGene2_name <- c("name")
+peaks_t$closGene3 <- c("id") #make an empty column for 3
+peaks_t$closGene3_name <- c("name")
+
+
+for (i in (1:length(peaks_t))){
+  #meta_enhancers[i]
+  #closest <- meta_enhancers$closGene1[i]
+  #Closest Gene 1
+  ind <- c()
+  closGene1 <- peaks_t$closGene1[i]
+  
+  #closest gene 2
+  sub_five_prime <- five_prime[!five_prime$gene_id==closGene1] #discard closest
+  peaks_t$closGene2[i] <- sub_five_prime$gene_id[GenomicRanges::nearest(peaks_t[i],sub_five_prime)] #add the 2 closest gene-id
+  peaks_t$closGene2_name[i] <- sub_five_prime$gene_name[GenomicRanges::nearest(peaks_t[i],sub_five_prime)] #add the gene_name
+  closGene2 <-peaks_t$closGene2[i]
+  #closest gene 3
+  sub_sub_five_prime <- sub_five_prime[!sub_five_prime$gene_id==closGene2] #discard 1 and 2 closest
+  peaks_t$closGene3[i] <- sub_sub_five_prime$gene_id[GenomicRanges::nearest(peaks_t[i],sub_sub_five_prime)] #add the 3 closest
+  peaks_t$closGene3_name[i] <- sub_sub_five_prime$gene_name[GenomicRanges::nearest(peaks_t[i],sub_sub_five_prime)] #add the gene_nam
+} 
+
+
+```
+
+```{r,echo=F}
+#make into dataframe and give IDs!
+df_peaks_t <- as.data.frame(peaks_t)
+df_peaks_t$name <- paste(df_peaks_t$seqnames,df_peaks_t$start,df_peaks_t$end, sep = '-')
+```
+
+```{r,echo=F}
+#split up in dataframes
+df_peaks_promoters <- df_peaks_t[df_peaks_t$promoters,]
+df_peaks_promoters$ID <- paste0("prom_",c(1:nrow(df_peaks_promoters)))
+
+df_peaks_CDS <- df_peaks_t[ !df_peaks_t$promoters & df_peaks_t$CDS,]
+df_peaks_CDS$ID <- paste0("CDS_",c(1:nrow(df_peaks_CDS)))
+
+df_peaks_enhancers <- df_peaks_t[df_peaks_t$enhancers,]
+df_peaks_enhancers$ID <- paste0("enh_",c(1:nrow(df_peaks_enhancers)))
+
+#add info of IDS to big df
+df_peaks_t$ID<- "ID"
+df_peaks_t$annot<- "anno"
+df_peaks_t$ID[df_peaks_t$peak_ID %in% df_peaks_promoters$peak_ID] <- df_peaks_promoters$ID
+df_peaks_t$annot[df_peaks_t$peak_ID %in% df_peaks_promoters$peak_ID] <- "promoter"
+df_peaks_t$ID[df_peaks_t$peak_ID %in% df_peaks_CDS$peak_ID] <- df_peaks_CDS$ID
+df_peaks_t$annot[df_peaks_t$peak_ID %in% df_peaks_CDS$peak_ID] <- "CDS"
+df_peaks_t$ID[df_peaks_t$peak_ID %in% df_peaks_enhancers$peak_ID] <- df_peaks_enhancers$ID
+df_peaks_t$annot[df_peaks_t$peak_ID %in% df_peaks_enhancers$peak_ID] <- "enhancer"
+```
+
+
+```{r,echo=F}
+#sve data as table and bedfile 
+write.table(df_peaks_t,file = file.path(dir_out,"peaks_all.txt"),quote = F,row.names = F)
+write_bed(df_peaks_t,file.path(dir_out,"peaks_all.bed"))
+
+write.table(df_peaks_CDS,file = file.path(dir_out,"peaks_CDS.txt"),quote = F,row.names = F)
+write_bed(df_peaks_CDS,file.path(dir_out,"peaks_CDS.bed"))
+write.table(df_peaks_enhancers,file = file.path(dir_out,"peaks_enhancers.txt"),quote = F,row.names = F)
+write_bed(df_peaks_enhancers,file.path(dir_out,"peaks_enhancers.bed"))
+write.table(df_peaks_promoters,file = file.path(dir_out,"peaks_promoters.txt"),quote = F,row.names = F)
+write_bed(df_peaks_promoters,file.path(dir_out,"peaks_promoters.bed"))
+```
+
+
+
+
+
+
+
+
+
+
+
